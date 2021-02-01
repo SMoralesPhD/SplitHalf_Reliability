@@ -1,0 +1,285 @@
+---
+title: "ECHO Split-Half Reliablity Script"
+author: "Santi"
+date: "2/5/2019"
+output:
+  html_document:
+    toc: true
+    fig_height: 8.5
+    fig_width: 12
+    css: custom 2.css
+---
+
+This script computes the effect sizes and split-half reliablity for different ERP conditions in increasing numbers of trials. 
+
+```{r, echo = FALSE}
+options(width = 160)
+options(knitr.table.format = "html")
+```
+
+# Setup
+```{r eval=TRUE, echo=T, message=FALSE, warning=FALSE, results='hide', fig.show='hide'}
+# Set working directory
+setwd("/Users/santiagomorales/Dropbox/Fox_Lab/TOTS/CBCL_Trajectories/") 
+
+list.of.packages <- c("psych", "zoo", "reshape2", "car","taRifx", "ggplot2", "nlme", "R.matlab", "tidyr","dplyr","foreach", "doParallel","effsize")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+# Loading packages
+lapply(list.of.packages, require, character.only = TRUE)
+
+# Setting my plotting options
+my_opts <- list(theme_classic() + theme(axis.text=element_text(size=14), axis.title=element_text(size=15,face="bold"), legend.title=element_text(size=14,face="bold"), legend.text=element_text(size=13), strip.text.x = element_text(size = 14, face="bold")))
+source("/Users/santiagomorales/Dropbox/R_dropbox/data.check_function.R") # Reading in function from file
+############################################################
+
+# Options for parallel
+registerDoParallel(4)  # use multicore, set to the number of our cores
+opts <- list(chunkSize=2)
+comb <- function(x, ...) { # Setting up this function for later
+  lapply(seq_along(x),
+    function(i) c(x[[i]], lapply(list(...), function(y) y[[i]])))
+}
+
+```
+
+The data should be trial-level data for each subject in one large spreadsheet. The script here assumes that the participant is labeled "id" and the different conditions as "Condition" and the different groups (in this case different ages) "age."
+
+# Reliability
+## ERPs
+#### Between age
+```{r}
+dfm.ag <- dfm.ag %>% unite(Condition, Condition, age, remove = T)  # To look across age, I need to add age here to the condition
+dfm.ag$Condition <- as.factor(dfm.ag$Condition) # This variable needs to be a factor
+
+system.time({
+rel_result_age <- foreach(s = seq(4, 32, 4), .combine='comb', .options.nws=opts, .multicombine=TRUE,  .errorhandling="pass",
+                .init=list(list(), list())) %:%           # If adding a third list, remember to add a list here e.g., .init=list(list(), list(), list()))
+  foreach(i = 1:3000, .combine='comb', .multicombine=TRUE,  .errorhandling="pass",  # Indicating how many subsamples
+                .init=list(list(), list())) %dopar% {  # If adding a third list, remember to add a list here e.g., .init=list(list(), list(), list()))
+    seed = sample(1:10000000, 1)
+    set.seed(seed)   ## set the seed to make your partition reproducible
+    
+    list.of.packages <- c("psych", "zoo", "reshape2", "car","taRifx", "ggplot2", "tidyr","dplyr","foreach", "doParallel","effsize")       
+    lapply(list.of.packages, require, character.only = TRUE)  
+    
+    # Before subsampling, I need to delete participants that do not have enough trials
+    n_trials <- dfm.ag %>%
+      group_by(Condition, id) %>%
+      tally() 
+    
+    ids.out <- n_trials[n_trials$n < s,] %>% dplyr::select(Condition, id) %>% unite(Condition_id, Condition, id)
+
+    # # This is similar to the loop above however, I need to create a subsampled dataset first
+    df_temp_s <- dfm.ag %>%
+      unite(Condition_id, Condition, id, remove = F) %>%
+      dplyr::filter(!Condition_id %in% ids.out$Condition_id) %>% 
+      group_by(Condition, id) %>% 
+      sample_n(s)
+    
+    # Now I can do the split half on the subsampled dataset
+    df_temp <- df_temp_s %>% 
+      sample_frac(.50) %>%      # Creating a random half
+      mutate(bin = 1) %>%       # Indicating that this is the first half 
+      dplyr::select(id, trial,Condition, bin) %>%  # Keeping only vars of interest
+      right_join(df_temp_s, by = c("id", "trial", "Condition")) %>%  # Bringing in the other half of the trials
+      mutate(bin = if_else(is.na(bin), 2, 1)) %>%  # Creating the index for the second half of the trials
+      group_by(Condition, id, bin) %>%    # Grouping by vars of interest
+      dplyr::summarise(Mean_amp = mean(value, na.rm = T)) %>% # Getting the mean amplitude by vars of interest
+      unite(Condition_bin, Condition, bin)  %>% # Creating the variable name
+      spread(Condition_bin, Mean_amp) # Going to wide using our new variable
+    
+    
+    # Checking the reliability
+    r_temp <- corr.test(df_temp[,-c(1)])$r
+    n_temp <- corr.test(df_temp[,-c(1)])$n
+    r_temp <- (2*r_temp)/(1 + abs(r_temp)) # SB formula
+    
+    conditions_temp <- unique(gsub("(.*)_.*","\\1",row.names(r_temp))) # removing everything after the last "_" and only keeping unique conditions  
+    
+    r_temp_df <- data.frame()
+    for (j in seq(2,sqrt(length(r_temp)), 2) ) { # Setting up a loop over the number of conditions
+      r_temp_df_j <- r_temp[j,j-1]               # getting the index for that condition it is the row number and the column of j - 1
+      r_temp_df_j <- data.frame(variable = conditions_temp[j/2], rcoeff = r_temp_df_j) # Getting the name of the conditions and it has to be divided by two
+      r_temp_df_j$n <- ifelse(length(n_temp) == 1, n_temp, ifelse(length(n_temp) > 1, n_temp[j,j-1], "Error!")) # getting the n for that condition it is the same for all or the row number and the column of j - 1
+      r_temp_df_j$seed = seed # Setting the seed 
+      r_temp_df_j$n_trials = s # Setting the number that was subsampled by
+      
+      r_temp_df <- bind_rows(r_temp_df, r_temp_df_j)
+    
+    }
+    
+    ##### ##### ##### ##### ##### ##### ##### ##### ##### ##### ##### ##### #####
+    # Saving the t-value and effect size to determine the power to detect significant Condition effect
+    # Now using the subsampled dataset to get it ready for the t-test and effect size
+    df_t <- data.frame()
+    df_t_temp <- df_temp_s %>%
+      group_by(Condition, id) %>%
+      dplyr::summarise(Mean_amp = mean(value, na.rm = T)) # %>% # Next I just have to spread the data and run the t-test
+      # spread(Condition, Mean_amp) # Going to wide using our new variable
+    t_temp <- data.frame()
+    for (age_i in c("4Y","5Y","7Y","9Y")) {
+      df_t_temp_age <- df_t_temp[grepl(age_i, df_t_temp$Condition),]
+      df_t_temp_age$Condition <- gsub(paste0("_",age_i), "", df_t_temp_age$Condition)
+      # df_SME_temp_age <- df_t_temp_age # Saving this for SME computation
+            
+      df_t_temp_age <- spread(df_t_temp_age, Condition, Mean_amp)
+      t_result_ERN <- t.test(df_t_temp_age$Correct_ERN, df_t_temp_age$Error_ERN, paired = T)
+      eff_result_ERN <- cohen.d(df_t_temp_age$Correct_ERN, df_t_temp_age$Error_ERN, paired = T, na.rm=T)
+      t_result_Pe <- t.test(df_t_temp_age$Error_Pe, df_t_temp_age$Correct_Pe, paired = T)
+      eff_result_Pe <- cohen.d(df_t_temp_age$Error_Pe, df_t_temp_age$Correct_Pe, paired = T, na.rm=T)
+      
+      t_temp_age <- data.frame(t_val_ERN = t_result_ERN$statistic, df_ERN = t_result_ERN$parameter, Mean_dif_ERN = t_result_ERN$estimate,
+                               Cohend_ERN = eff_result_ERN$estimate, Cohend.LL_ERN = eff_result_ERN$conf.int[1], Cohend.UL_ERN = eff_result_ERN$conf.int[2],
+                         t_val_Pe = t_result_Pe$statistic, df_Pe = t_result_Pe$parameter, Mean_dif_Pe = t_result_Pe$estimate,
+                               Cohend_Pe = eff_result_Pe$estimate, Cohend.LL_Pe = eff_result_Pe$conf.int[1], Cohend.UL_Pe = eff_result_Pe$conf.int[2],
+                         seed = seed, n_trials = s, Age = age_i)
+      
+      t_temp <- bind_rows(t_temp, t_temp_age)
+    }
+    
+    df_t <- bind_rows(df_t, t_temp)
+    
+    # ##### ##### ##### ##### ##### ##### ##### ##### ##### ##### ##### ##### #####
+    # # Computing the SME based on Luck et al 2020 (preprint)
+    # # Now using the subsampled dataset to get it ready for the SME computation for each participant
+    # df_SME_temp <- df_temp_s %>%
+    #   group_by(Condition, id) %>%
+    #   dplyr::summarise(SME = (sd(value, na.rm = T)/sqrt(length(value)) ),
+    #                    seed = seed, n_trials = s)  # %>% # Next I just have to spread the data and run the t-test
+    
+    # Returning everything out of the parallel loop
+    # return(list(r_temp_df, df_t, df_SME_temp)) #If adding a third list, remember to add a list on loops above e.g., .init=list(list(), list(), list()))
+    return(list(r_temp_df, df_t))
+}
+})
+df_r <- do.call(dplyr::bind_rows, rel_result_age[[1]])
+df_t <- do.call(dplyr::bind_rows, rel_result_age[[2]])
+# df_SME <- do.call(dplyr::bind_rows, rel_result_age[3]) # Maybe this is not very efficient and maybe not useful
+
+```
+
+##### Plots
+```{r}
+cutoff <- 6 # Indicating how many participants should be there to believe the correlation
+
+df_r$Age <- as.numeric(gsub("[^\\d]+", "", df_r$variable, perl=TRUE))# Separating age and condition
+df_r$variable <- sub("_[^_]+$", "", df_r$variable)
+# Making sure that they at least have 6 people before looking at their correlation
+df_r$rcoeff[df_r$n < cutoff] <- NA
+df_r$rcoeff[df_r$rcoeff < 0] <- 0
+
+
+dfm_r <- df_r # no need for melting anymore
+
+# Plotting
+ggplot(dfm_r, aes(n_trials, rcoeff, color = variable, fill = variable, group = variable)) + stat_summary(fun.y = mean, geom = "point",  position=position_dodge(width=0.7)) + stat_summary(fun.y = mean, geom = "line",  aes(group = variable)) + my_opts+ labs(x = "# of Trials", y = "Split-Half Reliability")  + geom_hline(yintercept=.9, color='black', linetype = 2) + geom_hline(yintercept=.8, color='black', linetype = 1) + geom_hline(yintercept=.7, color='black', linetype = 3) + geom_hline(yintercept=.6, color='red', linetype = 4) +  scale_x_continuous(limits = c(0, 80), breaks = seq(0, 80, by = 5)) + theme(legend.position="bottom", legend.title = element_blank()) + facet_wrap(~Age)
+
+ggplot(dfm_r, aes(n_trials, rcoeff, color = as.factor(Age), fill = as.factor(Age), group = as.factor(Age))) + stat_summary(fun.y = mean, geom = "point",  position=position_dodge(width=0.7)) + stat_summary(fun.y = mean, geom = "line",  aes(group = Age)) + my_opts+ labs(x = "# of Trials", y = "Split-Half Reliability")  + geom_hline(yintercept=.9, color='black', linetype = 2) + geom_hline(yintercept=.8, color='black', linetype = 1) + geom_hline(yintercept=.7, color='black', linetype = 3) + geom_hline(yintercept=.6, color='red', linetype = 4) +  scale_x_continuous(limits = c(0, 34), breaks = seq(0, 32, by = 4)) + theme(legend.position="bottom", legend.title = element_blank()) + facet_wrap(~variable)
+
+
+# Plots with confidence intervals
+dfm_r_ag <- dfm_r %>% 
+  group_by(n_trials, variable, Age) %>% # Grouping by vars of interest
+  dplyr::summarise(Mean = mean(rcoeff, na.rm = T), Median = median(rcoeff), ci_L = quantile(rcoeff, .025, na.rm = T), ci_U = quantile(rcoeff, .975, na.rm = T))
+
+# dfm_r_ag$ci_L[dfm_r_ag$variable != "Updated"] <- NA
+# dfm_r_ag$ci_U[dfm_r_ag$variable != "Updated"] <- NA
+
+pd <- position_dodge(1) 
+ggplot(dfm_r_ag, aes(x=n_trials, y=Mean, color = variable, fill = variable, group = variable)) + 
+    geom_errorbar(aes(ymin=ci_L, ymax=ci_U), width=.2, position=pd) + geom_line(position=pd) + geom_point(position=pd) + coord_cartesian(ylim = c(0,1), xlim = c(0,80)) + my_opts +  geom_hline(yintercept=.9, color='black', linetype = 2) + geom_hline(yintercept=.8, color='black', linetype = 1) + geom_hline(yintercept=.7, color='black', linetype = 3) + geom_hline(yintercept=.6, color='red', linetype = 4)  + facet_wrap(~Age)
+
+ggplot(dfm_r_ag, aes(x=n_trials, y=Mean, color = as.factor(Age), fill = as.factor(Age), group = as.factor(Age))) + 
+    geom_errorbar(aes(ymin=ci_L, ymax=ci_U), width=.3, position=pd) + geom_line(position=pd) + geom_point(position=pd) + coord_cartesian(ylim = c(0,1), xlim = c(0,80)) + my_opts +  geom_hline(yintercept=.9, color='black', linetype = 2) + geom_hline(yintercept=.8, color='black', linetype = 1) + geom_hline(yintercept=.7, color='black', linetype = 3) + geom_hline(yintercept=.6, color='red', linetype = 4)  + facet_wrap(~variable)
+
+dfm_r_ag$Mean_fix <- ifelse(dfm_r_ag$Mean <0, 0, dfm_r_ag$Mean)
+dfm_r_ag$ci_L_fix <- ifelse(dfm_r_ag$ci_L <0, 0, dfm_r_ag$ci_L)
+dfm_r_ag$ci_U_fix <- ifelse(dfm_r_ag$ci_U <0, 0, dfm_r_ag$ci_U)
+dfm_r_ag$variable_fix <- recode_factor(dfm_r_ag$variable, !!!list('Correct_ERN'='Correct (CRN)', 'Correct_Pe'='Correct (Pe)', 
+                                                                  'Error_ERN'='Error (ERN)', 'Error_Pe'='Error (Pe)')) # Recoding for plot
+
+dfm_r_ag$Age <- as.factor(dfm_r_ag$Age)
+
+(p.erp.rel <- ggplot(dfm_r_ag, aes(x=n_trials, y=Mean_fix, color = Age, fill = Age, group = Age)) + 
+    geom_errorbar(aes(ymin=ci_L_fix, ymax=ci_U_fix), width=.3, position=pd) + geom_line(position=pd) + geom_point(position=pd) + coord_cartesian(ylim = c(0,1), xlim = c(0,32)) + my_opts +  geom_hline(yintercept=.9, color='black', linetype = 2) + geom_hline(yintercept=.8, color='black', linetype = 1) + geom_hline(yintercept=.7, color='black', linetype = 3) + geom_hline(yintercept=.6, color='red', linetype = 4) + labs(x = "Number of Trials", y = "Split-Half Reliability of ERPs") +  scale_x_continuous(limits = c(0, 34), breaks = seq(0, 32, by = 4)) + theme(legend.position="none") + facet_wrap(~variable_fix) )
+
+# Getting the number of trials needed for a given cutoff
+dfm_r_ag_cutoff_mean <- dfm_r_ag %>% 
+  group_by(variable, Age) %>% # Grouping by vars of interest
+  filter(Mean >= .6) %>%
+  filter(n_trials == min(n_trials)) %>%
+  ungroup()
+
+dfm_r_ag_cutoff_mean %>% select(n_trials, variable_fix, Age) %>% spread(variable_fix, n_trials) 
+
+dfm_r_ag_cutoff_ci <- dfm_r_ag %>% 
+  group_by(variable, Age) %>% # Grouping by vars of interest
+  filter(ci_U >= .6) %>%
+  filter(n_trials == min(n_trials)) %>%
+  ungroup()
+
+dfm_r_ag_cutoff_ci %>% select(n_trials, variable_fix, Age) %>% spread(variable_fix, n_trials) 
+
+# ###### Checking the power estimates to see how many trials for a significant effect
+# # Making sure we do not have less than six participants
+# df_t$t_val_Deviant[df_t$df_Deviant < (cutoff-2)] <- NA # It is dfs so I need to subtract two 
+# df_t$t_val_Deviant_late[df_t$df_Deviant_late < (cutoff-2)] <- NA # It is dfs so I need to subtract two 
+# df_t$t_val_Novel[df_t$df_Novel < (cutoff-2)] <- NA # It is dfs so I need to subtract two 
+# 
+# dfm_t <- melt(df_t[,c("t_val_Deviant", "t_val_Deviant_late", "t_val_Novel", "n_trials", "Age")], id=c("n_trials", "Age"))
+# dfm_t$variable <- recode_factor(dfm_t$variable, !!!list('t_val_Deviant'='Deviant', 't_val_Deviant_late'='Deviant Late', 't_val_Novel'='Novel')) # Recoding for plot
+# 
+# # Plotting
+# ggplot(dfm_t, aes(n_trials, abs(value), color = variable, fill = variable, group = variable)) + stat_summary(fun.y = mean, geom = "point") + stat_summary(fun.y = mean, geom = "line",  aes(group = variable)) + my_opts+ labs(x = "Number of Trials", y = "t-value") + geom_hline(yintercept=1.96, color='black', linetype = 2) + geom_hline(yintercept=3.291, color='black', linetype = 1)  + theme(legend.position="bottom", legend.title = element_blank()) + facet_wrap(~Age)
+# 
+# # Power analyses - how many random subsamples cross the limit? 
+# df_t_per <- dfm_t %>% mutate(over_05 = ifelse(abs(value) > 1.96, 1, 0),
+#                          over_001 = ifelse(abs(value) > 3.291, 1, 0)) %>%
+#         group_by(n_trials, variable, Age) %>%
+#         summarise(over_05 = sum(over_05)/length(over_05),
+#                   over_001 = sum(over_001)/length(over_001))
+# names(df_t_per)[names(df_t_per) == "variable"] <- "type"
+# df_t_per <- melt(df_t_per, id.vars = c("n_trials", "type", "Age"))  
+# df_t_per$variable <- recode_factor(df_t_per$variable, !!!list('over_05'='t=1.96 (p<.05)', 'over_001'='t=3.29 (p<.001)')) # Recoding for plot
+# 
+# ggplot(df_t_per, aes(n_trials, value, color = type, fill = type, group = type)) + stat_summary(fun.y = mean, geom = "point",  position=position_dodge(width=0.7)) + stat_summary(fun.y = mean, geom = "line",  aes(group = type)) + my_opts+ labs(x = "Number of Trials", y = "Percent of bootstrap samples") + facet_wrap(~variable) + geom_hline(yintercept=.9, color='black', linetype = 2) + geom_hline(yintercept=.8, color='black', linetype = 1) + geom_hline(yintercept=.95, color='black', linetype = 3) + facet_wrap(~Age)
+# 
+# 
+# # It seems like this would be heavily impacted by sample size - it would be good to provide actual effect sizes. However, even Cohen's d is dependent on the sample size
+
+#####
+# Plotting the effect sizes
+df_t$Cohend_ERN[df_t$df_ERN < (cutoff-2)] <- NA # It is dfs so I need to subtract two 
+df_t$Cohend_Pe[df_t$df_Pe < (cutoff-2)] <- NA # It is dfs so I need to subtract two 
+
+dfm_Cohend <- melt(df_t[,c("Cohend_ERN", "Cohend_Pe", "n_trials", "Age")], id=c("n_trials", "Age"))
+dfm_Cohend$variable <- recode_factor(dfm_Cohend$variable, !!!list('Cohend_ERN'='ERN', 'Cohend_Pe'='Pe')) # Recoding for plot
+
+# Plotting
+ggplot(dfm_Cohend, aes(n_trials, abs(value), color = variable, fill = variable, group = variable)) + stat_summary(fun.y = mean, geom = "point") + stat_summary(fun.y = mean, geom = "line",  aes(group = variable)) + my_opts+ labs(x = "Number of Trials", y = "Effect Size (Cohen's d)") + theme(legend.position="bottom", legend.title = element_blank()) + facet_wrap(~Age)
+
+dfm_Cohend$Age <- as.factor(dfm_Cohend$Age)
+ggplot(dfm_Cohend, aes(n_trials, abs(value), color = Age, fill = Age, group = Age)) + stat_summary(fun.y = mean, geom = "point") + stat_summary(fun.y = mean, geom = "line",  aes(group = Age)) + my_opts+ labs(x = "Number of Trials", y = "Effect Size (Cohen's d)") + theme(legend.position="bottom", legend.title = element_blank()) + facet_wrap(~variable) + ylim(0, 1.7)
+
+# Plots with confidence intervals
+dfm_Cohend_ag <- dfm_Cohend %>% 
+  group_by(n_trials, variable, Age) %>% # Grouping by vars of interest
+  dplyr::summarise(Mean = mean(value, na.rm = T), Median = median(value), ci_L = quantile(value, .025, na.rm = T), ci_U = quantile(value, .975, na.rm = T))
+
+dfm_Cohend_ag$Age <- as.factor(dfm_Cohend_ag$Age)
+
+ggplot(dfm_Cohend_ag, aes(x=n_trials, y=Mean, color = Age, fill = Age, group = Age)) + 
+    geom_errorbar(aes(ymin=ci_L, ymax=ci_U), width=.2, position=pd) + geom_line(position=pd) + geom_point(position=pd) + coord_cartesian(xlim = c(0,32)) + my_opts + labs(x = "Number of Trials", y = "Effect Size (Cohen's d)") + theme(legend.position="bottom", legend.title = element_blank()) + facet_wrap(~variable)
+
+dfm_Cohend_ag$Age <- as.numeric(gsub("Y", "", dfm_Cohend_ag$Age))
+dfm_Cohend_ag$Age <- as.factor(dfm_Cohend_ag$Age)
+
+# Plotting
+(p.erp.es <- ggplot(dfm_Cohend_ag, aes(n_trials, Mean, color = Age, fill = Age, group = Age)) + geom_line(position=pd) + geom_point(position=pd) +  geom_errorbar(aes(ymin=ci_L, ymax=ci_U), width=.2, position=pd) + geom_line(position=pd) + my_opts+ labs(x = "Number of Trials", y = "Effect Size of ERP (Cohen d)") +  scale_x_continuous(limits = c(0, 34), breaks = seq(0, 32, by = 4)) + theme(legend.position="none") + facet_wrap(~variable) +
+     geom_hline(yintercept=.8, color='black', linetype = 2) + geom_hline(yintercept=.5, color='black', linetype = 1) + geom_hline(yintercept=.2, color='black', linetype = 3) +
+    geom_hline(yintercept=-.8, color='black', linetype = 2) + geom_hline(yintercept=-.5, color='black', linetype = 1) + geom_hline(yintercept=-.2, color='black', linetype = 3) )
+
+
+```
+
